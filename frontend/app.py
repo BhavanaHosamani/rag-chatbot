@@ -1,10 +1,7 @@
 import streamlit as st
 import requests
 
-API_URL = st.secrets.get(
-    "API_URL",
-    "https://rag-chatbot-96sp.onrender.com"
-)
+API_URL = "https://rag-chatbot-96sp.onrender.com"
 
 SESSION = requests.Session()
 
