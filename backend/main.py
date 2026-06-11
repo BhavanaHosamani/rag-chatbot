@@ -1,19 +1,21 @@
 import os
-import shutil
 import httpx
 import tempfile
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-from rag.loader import load_documents
 from rag.splitter import split_documents
 from rag.embeddings import get_embeddings
 from rag.vector_store import create_vector_store
 from rag.tools import set_vector_store, search_pdf, get_pdf_list, delete_pdf_store
 from rag.agent import create_agent
+from rag.auth import (
+    sign_up, sign_in, verify_token,
+    register_pdf_for_user, get_pdfs_for_user, delete_pdf_record
+)
 from rag.supabase_storage import (
     upload_pdf_to_supabase,
     download_pdf_from_supabase,
@@ -26,24 +28,21 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain_community.document_loaders import PyPDFLoader
 
 # =========================
-# OpenRouter Configuration
+# Config
 # =========================
 
 os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
-
 http_client = httpx.Client(timeout=120.0)
 
 # =========================
-# FastAPI App
+# App
 # =========================
 
-app = FastAPI(title="RAG Chatbot API", version="3.0.0")
-
+app = FastAPI(title="RAG Chatbot API", version="4.0.0")
 
 @app.get("/")
 async def home():
     return {"message": "RAG Chatbot API is running!", "status": "success"}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,7 +53,7 @@ app.add_middleware(
 )
 
 # =========================
-# Agent & LLM Init
+# Agent & LLM
 # =========================
 
 agent_executor = create_agent()
@@ -67,143 +66,206 @@ llm = ChatOpenAI(
 )
 
 # =========================
-# Restore PDFs on startup
+# Auth Helper
+# =========================
+
+def get_current_user(authorization: str = None) -> dict:
+    """Extract and verify JWT from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        return verify_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+# =========================
+# Startup — Restore PDFs
 # =========================
 
 @app.on_event("startup")
 async def restore_pdfs_on_startup():
-    """
-    On every Render restart, re-download all PDFs from Supabase
-    and rebuild their vector stores in memory.
-    """
-    print("🔄 Restoring PDFs from Supabase Storage...")
-    pdf_names = list_pdfs_from_supabase()
+    """On Render restart, rebuild all users' vector stores from Supabase."""
+    print("🔄 Restoring PDFs from Supabase...")
+    from rag.auth import get_service_client
+    try:
+        client = get_service_client()
+        response = client.table("user_pdfs").select("user_id, pdf_name").execute()
+        rows = response.data or []
+    except Exception as e:
+        print(f"❌ Could not fetch user_pdfs: {e}")
+        return
 
     embeddings = get_embeddings()
-
-    for pdf_name in pdf_names:
+    for row in rows:
+        user_id = row["user_id"]
+        pdf_name = row["pdf_name"]
+        store_key = f"{user_id}/{pdf_name}"
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp_path = tmp.name
-
-            download_pdf_from_supabase(pdf_name, tmp_path)
-
+            download_pdf_from_supabase(user_id, pdf_name, tmp_path)
             loader = PyPDFLoader(tmp_path)
             documents = loader.load()
             chunks = split_documents(documents)
             vector_store = create_vector_store(chunks, embeddings)
-            set_vector_store(pdf_name, vector_store)
-
+            set_vector_store(store_key, vector_store)
             os.unlink(tmp_path)
-            print(f"  ✅ Restored: {pdf_name}")
+            print(f"  ✅ Restored: {store_key}")
         except Exception as e:
-            print(f"  ❌ Failed to restore {pdf_name}: {e}")
+            print(f"  ❌ Failed to restore {store_key}: {e}")
 
-    print(f"✅ Restored {len(pdf_names)} PDF(s) from Supabase.")
+    print(f"✅ Restored {len(rows)} PDF(s).")
 
 # =========================
 # Request Models
 # =========================
+
+class SignUpRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 class QueryRequest(BaseModel):
     question: str
     chat_history: list = []
     pdf_name: Optional[str] = None
 
+# =========================
+# Auth Endpoints
+# =========================
+
+@app.post("/auth/signup")
+async def signup(request: SignUpRequest):
+    try:
+        data = sign_up(request.email, request.password)
+        return {"message": "Account created successfully!", **data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    try:
+        data = sign_in(request.email, request.password)
+        return {"message": "Login successful!", **data}
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/auth/logout")
+async def logout(authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    token = authorization.replace("Bearer ", "").strip()
+    from rag.auth import sign_out
+    sign_out(token)
+    return {"message": "Logged out successfully."}
 
 # =========================
-# Upload PDF Endpoint
+# Upload PDF
 # =========================
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    """Upload PDF → save to Supabase Storage → build vector store in memory."""
+async def upload_pdf(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None)
+):
+    user = get_current_user(authorization)
+    user_id = user["user_id"]
 
-    # Read file bytes
     file_bytes = await file.read()
 
-    # 1. Upload to Supabase Storage
-    upload_pdf_to_supabase(file.filename, file_bytes)
+    # Upload to Supabase under user's folder
+    upload_pdf_to_supabase(user_id, file.filename, file_bytes)
 
-    # 2. Save to a temp file for processing
+    # Register in user_pdfs table
+    register_pdf_for_user(user_id, file.filename)
+
+    # Build vector store — key is "user_id/filename"
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
-    # 3. Build vector store
     loader = PyPDFLoader(tmp_path)
     documents = loader.load()
     chunks = split_documents(documents)
     embeddings = get_embeddings()
     vector_store = create_vector_store(chunks, embeddings)
-    set_vector_store(file.filename, vector_store)
-
-    # 4. Clean up temp file
+    store_key = f"{user_id}/{file.filename}"
+    set_vector_store(store_key, vector_store)
     os.unlink(tmp_path)
 
     return {
-        "message": f"{file.filename} uploaded and processed successfully!",
+        "message": f"{file.filename} uploaded successfully!",
         "pdf_name": file.filename,
-        "chunks": len(chunks),
-        "storage": "supabase"
+        "chunks": len(chunks)
     }
 
-
 # =========================
-# List PDFs Endpoint
+# List PDFs
 # =========================
 
 @app.get("/pdfs")
-async def list_pdfs():
-    """Return all PDFs stored in Supabase."""
-    pdfs = list_pdfs_from_supabase()
+async def list_pdfs(authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    pdfs = get_pdfs_for_user(user["user_id"])
     return {"pdfs": pdfs}
 
-
 # =========================
-# Delete PDF Endpoint
+# Delete PDF
 # =========================
 
 @app.delete("/pdfs/{pdf_name}")
-async def delete_pdf(pdf_name: str):
-    """Delete PDF from Supabase Storage + remove its vector store from memory."""
+async def delete_pdf(
+    pdf_name: str,
+    authorization: Optional[str] = Header(None)
+):
+    user = get_current_user(authorization)
+    user_id = user["user_id"]
 
-    # Remove from Supabase
-    deleted = delete_pdf_from_supabase(pdf_name)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"{pdf_name} not found in storage.")
+    # Delete from Supabase Storage
+    delete_pdf_from_supabase(user_id, pdf_name)
 
-    # Remove from in-memory vector stores
-    delete_pdf_store(pdf_name)
+    # Delete from user_pdfs table
+    delete_pdf_record(user_id, pdf_name)
+
+    # Delete from in-memory vector store
+    store_key = f"{user_id}/{pdf_name}"
+    delete_pdf_store(store_key)
 
     return {"message": f"{pdf_name} deleted successfully."}
 
-
 # =========================
-# Ask Question Endpoint
+# Ask Question
 # =========================
 
 @app.post("/ask")
-async def ask_question(request: QueryRequest):
+async def ask_question(
+    request: QueryRequest,
+    authorization: Optional[str] = Header(None)
+):
+    user = get_current_user(authorization)
+    user_id = user["user_id"]
     question = request.question
     pdf_name = request.pdf_name
 
-    context = search_pdf(question, pdf_name=pdf_name)
+    # Build store key scoped to this user
+    store_key = f"{user_id}/{pdf_name}" if pdf_name else None
+    context = search_pdf(question, pdf_name=store_key)
 
-    no_pdf_messages = [
+    no_pdf_msgs = [
         "No PDF uploaded yet. Please upload and process a PDF first.",
         "Selected PDF not found. Please re-upload.",
     ]
 
-    if context and context not in no_pdf_messages:
+    if context and context not in no_pdf_msgs:
         messages = [
             SystemMessage(content="""
 You are a highly knowledgeable AI assistant.
-
-You will be given context extracted from a PDF document and a question.
-
-Answer only using the provided context.
-
+Answer only using the provided PDF context.
 Rules:
 - Give detailed answers
 - Use bullet points when appropriate
@@ -212,30 +274,13 @@ Rules:
 - Be clear and structured
 - If information is missing, say so
 """),
-            HumanMessage(content=f"""
-Context from PDF:
-
-{context}
-
-Question:
-
-{question}
-
-Provide a detailed answer.
-""")
+            HumanMessage(content=f"Context from PDF:\n\n{context}\n\nQuestion:\n\n{question}\n\nProvide a detailed answer.")
         ]
-
         response = llm.invoke(messages)
-        return {
-            "answer": response.content,
-            "mode": "pdf",
-            "steps": [],
-            "sources": []
-        }
+        return {"answer": response.content, "mode": "pdf", "steps": [], "sources": []}
 
     else:
         result = agent_executor.invoke({"input": question})
-
         steps = result.get("intermediate_steps", [])
         formatted_steps = []
         for step in steps:
@@ -246,13 +291,7 @@ Provide a detailed answer.
                     "input": str(action.tool_input) if hasattr(action, "tool_input") else "",
                     "output": str(observation)
                 })
-
-        return {
-            "answer": result["output"],
-            "mode": "agent",
-            "steps": formatted_steps,
-            "sources": []
-        }
+        return {"answer": result["output"], "mode": "agent", "steps": formatted_steps, "sources": []}
 
 
 # =========================
